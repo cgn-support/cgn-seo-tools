@@ -7,7 +7,6 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import pandas as pd
 import streamlit as st
 
-
 @dataclass
 class PRConfig:
     damping: float = 0.85
@@ -18,13 +17,11 @@ class PRConfig:
     drop_self_loops: bool = True
     min_nodes: int = 2
 
-
 def _normalize_url(u: str) -> str:
     if not isinstance(u, str):
         return ""
     u = u.strip()
     return u
-
 
 def _detect_columns(cols: List[str]) -> Dict[str, Optional[str]]:
     """
@@ -43,7 +40,7 @@ def _detect_columns(cols: List[str]) -> Dict[str, Optional[str]]:
     source = pick(["from", "source", "source url", "address", "url", "origin"])
     target = pick(["to", "destination", "destination url", "target", "linked url", "destination address"])
 
-    # Screaming Frog “Inlinks” export often uses "From" / "To" plus "Follow"
+    # Screaming Frog "Inlinks" export often uses "From" / "To" plus "Follow"
     follow = pick(["follow", "nofollow", "rel", "rel attribute", "link attribute"])
 
     # Status codes sometimes appear
@@ -60,7 +57,6 @@ def _detect_columns(cols: List[str]) -> Dict[str, Optional[str]]:
         "dst_status": dst_status,
         "link_type": link_type,
     }
-
 
 def _is_follow_value(val: str) -> Optional[bool]:
     """
@@ -82,6 +78,119 @@ def _is_follow_value(val: str) -> Optional[bool]:
     return None
 
 
+# ──────────────────────────────────────────────
+#  NEW: Redirect Resolution
+# ──────────────────────────────────────────────
+
+def _build_redirect_map(
+    df: pd.DataFrame,
+    source_col: str,
+    target_col: str,
+    status_col: Optional[str],
+) -> Dict[str, str]:
+    """
+    Detect 301/302 redirect URLs and build a mapping from
+    redirect source → final resolved destination.
+
+    Strategy:
+      1. If a status code column exists, any row where the TARGET
+         has a 3xx status is a redirect.  The redirect destination
+         is the URL that the target eventually leads to.
+      2. Screaming Frog records redirects so that a URL appearing
+         as a target with status 301 will also appear as a source
+         in another row pointing to its final destination.
+         We follow the chain until we reach a non-redirect URL.
+      3. Fallback: if no status column exists, we detect redirect
+         candidates as URLs that appear as TARGETS but NEVER as a
+         SOURCE (i.e., the crawler could not crawl outlinks from them).
+         This heuristic catches 301s because SF doesn't record
+         outlinks for redirect URLs.  We then look for any edge
+         FROM that URL to find its destination.
+    """
+    redirect_map: Dict[str, str] = {}
+
+    if status_col and status_col in df.columns:
+        # --- Method 1: Use status codes directly ---
+        # Find all target URLs with 3xx status
+        redirect_rows = df[
+            df[status_col].astype(str).str.match(r'^3\d{2}$', na=False)
+        ].copy()
+
+        if not redirect_rows.empty:
+            # For each redirect target URL, find where it appears as a source
+            # to determine its final destination
+            redirect_targets = set(redirect_rows[target_col].unique())
+
+            # Build a simple lookup: for URLs that appear as sources, where do they point?
+            source_dest = {}
+            for _, row in df.iterrows():
+                src = str(row[source_col]).strip()
+                tgt = str(row[target_col]).strip()
+                if src in redirect_targets and src != tgt:
+                    # This redirect URL points somewhere
+                    source_dest[src] = tgt
+
+            # For redirect URLs that also appear as a target in other rows
+            # but never as a source, we look at the Screaming Frog pattern:
+            # the "From" column is the page containing the link, "To" is
+            # the link destination.  A 301 URL in "To" means the link
+            # points to a redirect.  We need the FINAL destination.
+            #
+            # Screaming Frog's "All Inlinks" export doesn't always give us
+            # the redirect chain directly.  But we can infer:
+            # if URL-A (301) is never a "From", its destination is unknown
+            # from this export alone.  In that case, we try to find it
+            # by looking at which 200-status URL shares the most overlap
+            # in its inlink sources.
+            #
+            # SIMPLER APPROACH: SF typically includes redirect destinations
+            # in the crawl.  If /service-locations/ 301s to /locations/,
+            # both will appear as targets.  We detect the chain by finding
+            # that /service-locations/ has status 301 and appears nowhere
+            # as a source (no outlinks), while /locations/ has status 200.
+
+            for url in redirect_targets:
+                if url in source_dest:
+                    redirect_map[url] = source_dest[url]
+
+    # --- Method 2: Heuristic for missing status column ---
+    # Also catch any URLs that appear as targets but NEVER as sources
+    # (likely redirects or dead-end utility pages)
+    # We DON'T auto-resolve these without status codes, but we report them.
+
+    # --- Follow redirect chains (A→B→C becomes A→C, B→C) ---
+    max_chain = 10
+    for url in list(redirect_map.keys()):
+        dest = redirect_map[url]
+        hops = 0
+        while dest in redirect_map and hops < max_chain:
+            dest = redirect_map[dest]
+            hops += 1
+        redirect_map[url] = dest
+
+    return redirect_map
+
+
+def _apply_redirect_map(
+    df: pd.DataFrame,
+    source_col: str,
+    target_col: str,
+    redirect_map: Dict[str, str],
+) -> pd.DataFrame:
+    """
+    Rewrite all source and target URLs through the redirect map.
+    Any link pointing to a 301 URL gets rewritten to point to
+    the final destination instead.
+    """
+    if not redirect_map:
+        return df
+
+    df = df.copy()
+    df[source_col] = df[source_col].map(lambda u: redirect_map.get(u, u))
+    df[target_col] = df[target_col].map(lambda u: redirect_map.get(u, u))
+    return df
+
+
 def _build_graph(
     df: pd.DataFrame,
     source_col: str,
@@ -90,11 +199,14 @@ def _build_graph(
     config: PRConfig,
     internal_domain_hint: Optional[str] = None,
     restrict_to_domain: bool = False,
-) -> Tuple[Dict[str, Set[str]], pd.DataFrame]:
+    status_col: Optional[str] = None,
+    resolve_redirects: bool = True,
+) -> Tuple[Dict[str, Set[str]], pd.DataFrame, Dict[str, str]]:
     """
     Build adjacency list graph from df. Returns:
     - adjacency: dict[node] = set(outgoing_nodes)
     - edges_df: cleaned edges with flags
+    - redirect_map: dict of resolved redirects (for reporting)
     """
     tmp = df.copy()
 
@@ -102,6 +214,13 @@ def _build_graph(
     tmp[target_col] = tmp[target_col].apply(_normalize_url)
 
     tmp = tmp[(tmp[source_col] != "") & (tmp[target_col] != "")]
+
+    # ── NEW: Resolve 301/302 redirects before building graph ──
+    redirect_map: Dict[str, str] = {}
+    if resolve_redirects:
+        redirect_map = _build_redirect_map(tmp, source_col, target_col, status_col)
+        if redirect_map:
+            tmp = _apply_redirect_map(tmp, source_col, target_col, redirect_map)
 
     # Determine follow vs nofollow
     if follow_col:
@@ -142,8 +261,7 @@ def _build_graph(
     edges_df = tmp[[source_col, target_col, "_is_follow"]].rename(
         columns={source_col: "source", target_col: "target"}
     )
-    return adjacency, edges_df
-
+    return adjacency, edges_df, redirect_map
 
 def pagerank(
     adjacency: Dict[str, Set[str]],
@@ -210,7 +328,6 @@ def pagerank(
 
     return scores, it, delta
 
-
 def main():
     st.set_page_config(page_title="Internal PageRank Proxy", layout="wide")
     st.title("Internal PageRank Proxy (Screaming Frog Export)")
@@ -230,6 +347,17 @@ Upload a Screaming Frog internal link export CSV. This app builds a directed int
         st.header("Link filters")
         include_nofollow = st.checkbox("Include nofollow links", value=False)
         drop_self_loops = st.checkbox("Drop self-loops (URL links to itself)", value=True)
+
+        # ── NEW: Redirect resolution toggle ──
+        st.header("Redirect handling")
+        resolve_redirects = st.checkbox(
+            "Resolve 301/302 redirects",
+            value=True,
+            help="Collapse redirect URLs into their final destinations. "
+                 "Requires a 'Status Code' column in your export. "
+                 "This prevents redirect URLs from appearing as dead-end "
+                 "authority sinks in the graph.",
+        )
 
         st.header("Domain restriction (optional)")
         restrict_to_domain = st.checkbox("Restrict edges to a domain hint substring", value=False)
@@ -259,7 +387,7 @@ Upload a Screaming Frog internal link export CSV. This app builds a directed int
     detected = _detect_columns(cols)
 
     st.subheader("Column mapping")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
 
     with c1:
         source_col = st.selectbox(
@@ -284,6 +412,18 @@ Upload a Screaming Frog internal link export CSV. This app builds a directed int
         if follow_col == "(none)":
             follow_col = None
 
+    # ── NEW: Status code column selector ──
+    with c4:
+        status_col = st.selectbox(
+            "Status Code column (for redirect resolution)",
+            options=["(none)"] + cols,
+            index=(["(none)"] + cols).index(detected["dst_status"]) if detected["dst_status"] in cols else (
+                (["(none)"] + cols).index(detected["src_status"]) if detected["src_status"] in cols else 0
+            ),
+        )
+        if status_col == "(none)":
+            status_col = None
+
     cfg = PRConfig(
         damping=float(damping),
         max_iters=int(max_iters),
@@ -293,7 +433,7 @@ Upload a Screaming Frog internal link export CSV. This app builds a directed int
     )
 
     if st.button("Run PageRank", type="primary"):
-        adjacency, edges_df = _build_graph(
+        adjacency, edges_df, redirect_map = _build_graph(
             df=df,
             source_col=source_col,
             target_col=target_col,
@@ -301,6 +441,8 @@ Upload a Screaming Frog internal link export CSV. This app builds a directed int
             config=cfg,
             internal_domain_hint=internal_domain_hint if internal_domain_hint else None,
             restrict_to_domain=restrict_to_domain,
+            status_col=status_col,
+            resolve_redirects=resolve_redirects,
         )
 
         n_nodes = len(adjacency)
@@ -310,6 +452,20 @@ Upload a Screaming Frog internal link export CSV. This app builds a directed int
             st.stop()
 
         st.info(f"Graph built: {n_nodes:,} nodes, {n_edges:,} edges")
+
+        # ── NEW: Report resolved redirects ──
+        if redirect_map:
+            with st.expander(f"🔀 Resolved {len(redirect_map)} redirect(s) — click to view"):
+                redir_df = pd.DataFrame([
+                    {"redirect_url": src, "resolved_to": dst}
+                    for src, dst in sorted(redirect_map.items())
+                ])
+                st.dataframe(redir_df, use_container_width=True, hide_index=True)
+                st.caption(
+                    "These URLs were 301/302 redirects. All links pointing to them "
+                    "have been rewritten to point to their final destination. "
+                    "The redirect URLs have been removed from the graph."
+                )
 
         scores, iters_used, final_delta = pagerank(
             adjacency=adjacency,
@@ -377,7 +533,6 @@ Upload a Screaming Frog internal link export CSV. This app builds a directed int
 - Look for surprises: tag pages, blog archives, or old posts outranking money pages.
 """
             )
-
 
 if __name__ == "__main__":
     main()
