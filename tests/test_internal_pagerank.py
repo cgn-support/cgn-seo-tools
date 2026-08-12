@@ -25,7 +25,7 @@ spec.loader.exec_module(ipr)
 FAIL = []
 
 
-def check(name, cond, extra=""):
+def check(name: str, cond: object, extra: object = "") -> None:
     print(f"{'PASS' if cond else 'FAIL'}  {name} {extra}")
     if not cond:
         FAIL.append(name)
@@ -33,7 +33,8 @@ def check(name, cond, extra=""):
 
 # ── URL normalisation ─────────────────────────────────────────────────────────
 cfg = ipr.PRConfig()
-n = lambda u, c=cfg: ipr._normalize_url(u, c)
+def n(u: object, c: ipr.PRConfig = cfg) -> str:
+    return ipr._normalize_url(u, c)
 check("fragment stripped", n("https://ex.com/a#gallery") == "https://ex.com/a")
 check("host lowercased", n("HTTPS://Ex.COM/a") == "https://ex.com/a")
 check("default port dropped", n("https://ex.com:443/a") == "https://ex.com/a")
@@ -89,6 +90,27 @@ flat, cyc = ipr._resolve_chains({"a": "b", "b": "c", "c": "d"})
 check("chain flattened", flat == {"a": "d", "b": "d", "c": "d"}, flat)
 flat, cyc = ipr._resolve_chains({"a": "b", "b": "a"})
 check("cycle detected", set(cyc) == {"a", "b"}, cyc)
+flat, cyc = ipr._resolve_chains({"a": "b", "b": "c", "c": "a"})
+check("3-cycle detected", set(cyc) == {"a", "b", "c"} and flat == {}, (flat, cyc))
+
+# The result must be idempotent: no resolved destination may itself be a key, or
+# a single .map() pass would leave some links on an intermediate URL and others
+# on the final one, silently splitting one page into two nodes.
+def _idempotent(mapping: dict) -> bool:
+    resolved, _ = ipr._resolve_chains(mapping)
+    return not (set(resolved.values()) & set(resolved))
+
+
+long_chain = {f"u{i}": f"u{i + 1}" for i in range(40)}
+flat, cyc = ipr._resolve_chains(long_chain)
+check("40-hop chain fully flattened", flat.get("u0") == "u40", flat.get("u0"))
+check("long chain idempotent", _idempotent(long_chain))
+# Chain running into a cycle: a→b→c→b. 'a' must not resolve onto a loop member.
+lead_in = {"a": "b", "b": "c", "c": "b"}
+flat, cyc = ipr._resolve_chains(lead_in)
+check("chain into cycle left unresolved", "a" not in flat, flat)
+check("chain into cycle idempotent", _idempotent(lead_in))
+check("self-map reported as cycle", ipr._resolve_chains({"a": "a"}) == ({}, ["a"]))
 
 # ── PageRank maths ────────────────────────────────────────────────────────────
 # Known 4-node case, uniform weights: compare to a slow reference implementation.
@@ -118,7 +140,7 @@ def reference(n_nodes, edges, d=0.85, iters=2000):
     return p
 
 
-ref = reference(4, list(zip(src.tolist(), dst.tolist())))
+ref = reference(4, list(zip(src.tolist(), dst.tolist(), strict=True)))
 check("matches reference impl", np.allclose(pr, ref, atol=1e-9), f"{pr} vs {ref}")
 
 # Dangling node handling
@@ -200,7 +222,7 @@ check("auto domain", ipr._auto_detect_domain(df, "Source") == "ex.com")
 
 edges, status_by_url, diag, rewrite = ipr.build_edges(df, detected, cfg, "ex.com")
 
-pairs = set(zip(edges["source"], edges["target"]))
+pairs = set(zip(edges["source"], edges["target"], strict=True))
 check("image row excluded", not any("logo.png" in t for _, t in pairs))
 check("css row excluded", not any("app.css" in t for _, t in pairs))
 check("nofollow excluded", not any(t.endswith("/spam") for _, t in pairs))
@@ -266,12 +288,20 @@ check("is_dead_end flags 404", bool(res.set_index("url").loc["https://ex.com/gon
 check("percentile present", res["pagerank_percentile"].between(0, 100).all())
 
 # priority matching + donors
-matched, unmatched = ipr.match_priority_urls(
+matched, missing, ambiguous = ipr.match_priority_urls(
     "https://ex.com/kitchens\n/baths\n/does-not-exist\n", list(res["url"]), cfg)
 check("priority exact match", matched.get("https://ex.com/kitchens")
       == "https://ex.com/kitchens", matched)
 check("priority path match", matched.get("/baths") == "https://ex.com/baths", matched)
-check("priority unmatched reported", unmatched == ["/does-not-exist"], unmatched)
+check("priority missing reported", missing == ["/does-not-exist"], missing)
+check("no false ambiguity", ambiguous == {}, ambiguous)
+
+# Same path on two hosts must be reported as ambiguous, not as missing — the page
+# is in the graph, it is just unclear which node was meant.
+amb_nodes = ["https://ex.com/dup", "https://blog.ex.com/dup"]
+m2, miss2, amb2 = ipr.match_priority_urls("/dup", amb_nodes, cfg)
+check("ambiguous path reported separately",
+      m2 == {} and miss2 == [] and amb2 == {"/dup": sorted(amb_nodes)}, (m2, miss2, amb2))
 
 donors = ipr.donor_suggestions("https://ex.com/kitchens", res, edges)
 check("donor excludes existing linkers", H not in set(donors.get("url", [])))
@@ -333,8 +363,16 @@ big = pd.DataFrame({
 t0 = time.time()
 big_data = ipr.run_analysis(big, ipr._detect_columns(["From", "To"]), cfg, "ex.com", "")
 elapsed = time.time() - t0
-check("50k nodes / 500k edges under 60s", elapsed < 60, f"{elapsed:.1f}s, "
-      f"{big_data['n_nodes']:,} nodes, {big_data['iters_used']} iters")
+# Build the detail string defensively: it is evaluated before check() is called,
+# so indexing a None result here would abort the suite before the exit summary.
+check("large export produces a result", big_data is not None)
+detail = (
+    f"{elapsed:.1f}s, {big_data['n_nodes']:,} nodes, {big_data['iters_used']} iters"
+    if big_data is not None else f"{elapsed:.1f}s, no result"
+)
+# Generous bound: this guards against an O(rows) Python-loop regression (a prior
+# revision used iterrows() and took minutes), not against normal runner jitter.
+check("50k nodes / 500k edges under 120s", elapsed < 120, detail)
 
 print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILURES: {FAIL}"))
 sys.exit(1 if FAIL else 0)

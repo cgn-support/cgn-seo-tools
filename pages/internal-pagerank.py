@@ -19,7 +19,7 @@ from __future__ import annotations
 import io
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import numpy as np
@@ -175,7 +175,7 @@ def _normalize_series(series: pd.Series, config: PRConfig) -> pd.Series:
     return series.map(lookup, na_action="ignore").fillna("")
 
 
-def _map_unique(series: pd.Series, fn) -> pd.Series:
+def _map_unique(series: pd.Series, fn: Callable[[str], object]) -> pd.Series:
     """Apply `fn` once per distinct value rather than once per row."""
     lookup = {value: fn(value) for value in pd.unique(series)}
     return series.map(lookup)
@@ -318,27 +318,34 @@ def _classify_position(val: object) -> str:
 #  Node consolidation: canonicals and redirects
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _resolve_chains(
-    mapping: Dict[str, str], max_hops: int = 10
-) -> Tuple[Dict[str, str], List[str]]:
-    """Flatten A→B→C into A→C. Returns (flattened, urls_in_cycles)."""
+def _resolve_chains(mapping: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+    """Flatten A→B→C into A→C. Returns (flattened, urls_in_cycles).
+
+    Every destination in the returned mapping is guaranteed not to be a key in
+    it, so applying the result is idempotent — a single pass cannot leave some
+    links on an intermediate URL and others on the final one, which would split
+    one page into two nodes. Chains that run into a cycle are reported and left
+    unresolved rather than pointed at an arbitrary member of the loop.
+
+    `seen` is a complete termination guarantee on its own: a walk can visit each
+    key at most once before repeating, so no hop limit is needed.
+    """
     resolved: Dict[str, str] = {}
     cycles: List[str] = []
     for start in mapping:
         seen = {start}
         dest = mapping[start]
-        hops = 0
-        while dest in mapping and hops < max_hops:
+        looped = False
+        while dest in mapping:
             if dest in seen:
-                cycles.append(start)
+                looped = True
                 break
             seen.add(dest)
             dest = mapping[dest]
-            hops += 1
-        if dest != start:
-            resolved[start] = dest
-        else:
+        if looped or dest == start:
             cycles.append(start)
+        else:
+            resolved[start] = dest
     return resolved, sorted(set(cycles))
 
 
@@ -360,7 +367,7 @@ def _build_redirect_map(
     mapping: Dict[str, str] = {}
 
     typed = edges[edges["_link_type"] == "redirect"]
-    for src, tgt in zip(typed["_source"], typed["_target"]):
+    for src, tgt in zip(typed["_source"], typed["_target"], strict=True):
         if src and tgt and src != tgt:
             mapping[src] = tgt
 
@@ -382,7 +389,7 @@ def _build_canonical_map(edges: pd.DataFrame) -> Dict[str, str]:
     """Map non-canonical URLs to their canonical from typed canonical rows."""
     canonical_rows = edges[edges["_link_type"] == "canonical"]
     mapping: Dict[str, str] = {}
-    for src, tgt in zip(canonical_rows["_source"], canonical_rows["_target"]):
+    for src, tgt in zip(canonical_rows["_source"], canonical_rows["_target"], strict=True):
         if src and tgt and src != tgt:
             mapping[src] = tgt
     return mapping
@@ -512,9 +519,9 @@ def build_edges(
 
     # ── Reasonable-surfer edge weights ──
     if config.use_position_weights:
-        weights = work["_position"].map(
-            lambda p: config.position_weights.get(p, 1.0)
-        ).astype(float)
+        weights = (
+            work["_position"].map(config.position_weights).fillna(1.0).astype(float)
+        )
     else:
         weights = pd.Series(1.0, index=work.index)
     if config.empty_anchor_weight != 1.0:
@@ -655,11 +662,16 @@ def guess_homepage(nodes: List[str], scores: np.ndarray, domain: Optional[str]) 
 
 def match_priority_urls(
     raw_lines: str, nodes: List[str], config: PRConfig
-) -> Tuple[Dict[str, str], List[str]]:
+) -> Tuple[Dict[str, str], List[str], Dict[str, List[str]]]:
     """Match pasted priority URLs to graph nodes.
 
     Exact normalised match first, then a path-only match so a bare "/kitchens"
-    still resolves. Returns ({input: node}, unmatched_inputs).
+    still resolves.
+
+    Returns ({input: node}, missing_inputs, {ambiguous_input: candidate_nodes}).
+    Missing and ambiguous are kept apart because they need opposite fixes: a
+    missing page is absent from the crawl, whereas an ambiguous one is in the
+    graph several times over and the user has to say which URL they meant.
     """
     node_set = set(nodes)
     by_path: Dict[str, List[str]] = {}
@@ -667,7 +679,8 @@ def match_priority_urls(
         by_path.setdefault(_path_of(u).rstrip("/") or "/", []).append(u)
 
     matched: Dict[str, str] = {}
-    unmatched: List[str] = []
+    missing: List[str] = []
+    ambiguous: Dict[str, List[str]] = {}
     for line in raw_lines.splitlines():
         candidate = line.strip()
         if not candidate:
@@ -681,9 +694,11 @@ def match_priority_urls(
         hits = by_path.get(path_key, [])
         if len(hits) == 1:
             matched[candidate] = hits[0]
+        elif hits:
+            ambiguous[candidate] = sorted(hits)
         else:
-            unmatched.append(candidate)
-    return matched, unmatched
+            missing.append(candidate)
+    return matched, missing, ambiguous
 
 
 def donor_suggestions(
@@ -1237,15 +1252,30 @@ def main() -> None:
         f"(delta {data['final_delta']:.2e}) · homepage: {data['homepage'] or 'not found'}"
     )
 
-    matched, unmatched = match_priority_urls(
+    matched, missing, ambiguous = match_priority_urls(
         st.session_state.get("pr_priority_raw", ""), list(data["result"]["url"]), config
     )
     priority = data["result"][data["result"]["url"].isin(set(matched.values()))].copy()
-    if unmatched:
+    if missing:
         st.warning(
             "These priority URLs are not in the link graph at all — they may be "
             "orphaned, blocked from crawling, or typed differently: "
-            + ", ".join(unmatched[:20])
+            + ", ".join(missing[:20])
+        )
+    if ambiguous:
+        st.warning(
+            "These priority URLs match several nodes that share the same path, so it "
+            "is not clear which one you meant. Paste the full URL of the one you want:"
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"you entered": entry, "could be": candidate}
+                    for entry, candidates in sorted(ambiguous.items())
+                    for candidate in candidates
+                ]
+            ),
+            width="stretch", hide_index=True,
         )
 
     tabs = st.tabs(["Overview", "Link opportunities", "Wasted equity", "All URLs", "Method"])

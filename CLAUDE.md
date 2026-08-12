@@ -163,14 +163,19 @@ seconds. Avoid `df.iterrows()` and per-row `apply` on the edge frame — use
 
 ### Testing
 
-`python tests/test_internal_pagerank.py` — a dependency-free suite (100+ checks)
-covering URL normalisation, column detection, link-type and placement
-classification, redirect/canonical consolidation, PageRank against a slow
-reference implementation, BFS depth, degenerate inputs, and a performance smoke
-test. Exits non-zero on failure.
+Two suites, both plain scripts that exit non-zero on failure:
 
-UI rendering is covered separately via `streamlit.testing.v1.AppTest`, which
-surfaces exceptions that Streamlit would otherwise only show in the browser.
+- `python tests/test_internal_pagerank.py` — dependency-free (115+ checks):
+  URL normalisation, column detection, link-type and placement classification,
+  redirect/canonical consolidation, PageRank against a slow reference
+  implementation, BFS depth, degenerate inputs, performance smoke test.
+- `python tests/test_ui_render.py` — drives the page through
+  `streamlit.testing.v1.AppTest`. Streamlit swallows render exceptions and shows
+  them in the browser only, so this is the only way to catch a broken tab.
+  Requires streamlit; skips cleanly if it is absent.
+
+Run both after any change to the page — the pure-logic suite will not notice a
+render regression, and vice versa.
 
 When making changes, also check edge cases by hand: empty files, single node, no
 edges, exports with only `From`/`To` columns.
