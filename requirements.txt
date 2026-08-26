@@ -1,2 +1,4 @@
-streamlit
+# width="stretch" on st.dataframe requires Streamlit 1.49.0 or later.
+streamlit>=1.49.0
 pandas
+numpy
